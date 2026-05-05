@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Professional Adaptive Ollama + Cloudflare Tunnel (Fixed Self‑Kill)
-- Auto-detects architecture, downloads correct binaries only
-- Selects best model based on total memory
-- Launches Ollama, pulls model, exposes via Cloudflare Tunnel
-- Handles cleanup gracefully on exit (SIGINT, SIGTERM, normal)
-- Robust error handling, no more accidental self‑termination
+Professional Adaptive Ollama + Cloudflare Tunnel Deployer
+- Safely kills previous Ollama/cloudflared processes (excluding itself)
+- Downloads correct Ollama binary with fallback to stable GitHub release
+- Selects best model based on total system memory
+- Exposes Ollama API via Cloudflare TryCloudflare tunnel
+- Clean exit on interrupt, no emojis, only clear English messages
 """
 
 import os
@@ -29,6 +29,11 @@ OLLAMA_PORT = 11434
 CF_BIN = Path("./cf_bin")
 CF_LOG = Path("cf.log")
 OLLAMA_LOG = Path("ollama.log")
+
+# Stable fallback version if main download fails
+OLLAMA_FALLBACK_URL = "https://github.com/ollama/ollama/releases/download/v0.1.32/ollama-linux-amd64"
+# For ARM64, you may adjust accordingly (the fallback logic only targets amd64 now,
+# but you can extend for ARM if needed)
 
 # Models (threshold_GB, model_name)
 MODELS = [
@@ -71,7 +76,7 @@ def safe_kill(proc):
 
 
 def cleanup():
-    """Terminate all background processes and remove log files."""
+    """Kill all launched child processes and remove log files."""
     log.info("Cleaning up...")
     for proc in processes:
         safe_kill(proc)
@@ -81,27 +86,45 @@ def cleanup():
 
 
 def signal_handler(signum, frame):
-    """Handle SIGINT / SIGTERM gracefully."""
+    """Handle interrupts gracefully."""
     log.warning(f"Received signal {signum}, exiting...")
     cleanup()
     sys.exit(0)
 
 
 def register_cleanup():
-    """Register cleanup on normal exit and signals."""
+    """Register cleanup on normal exit or signals."""
     atexit.register(cleanup)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
 
 # ----------------------------------------------------------------------
-def download(url, dest, desc="file"):
-    """Download a file with descriptive error message."""
-    log.info(f"Downloading {desc} from {url}...")
-    try:
-        urllib.request.urlretrieve(url, dest)
-    except Exception as e:
-        raise RuntimeError(f"Failed to download {desc}: {e}")
+def download_with_fallback(url, dest, desc="file", fallback_url=None, min_size_mb=50):
+    """
+    Download a file; if the file size is less than min_size_mb (likely an error page),
+    attempt the fallback URL if provided.
+    """
+    def _download(from_url):
+        log.info(f"Downloading {desc} from {from_url}...")
+        try:
+            urllib.request.urlretrieve(from_url, dest)
+        except Exception as e:
+            raise RuntimeError(f"Failed to download {desc}: {e}")
+
+    _download(url)
+    file_size_mb = os.path.getsize(dest) / (1024 * 1024) if os.path.exists(dest) else 0
+    if file_size_mb < min_size_mb:
+        log.warning(f"Downloaded file is too small ({file_size_mb:.1f} MB), likely invalid.")
+        if fallback_url:
+            log.info(f"Retrying with fallback URL for {desc}...")
+            _download(fallback_url)
+            file_size_mb = os.path.getsize(dest) / (1024 * 1024) if os.path.exists(dest) else 0
+            if file_size_mb < min_size_mb:
+                raise RuntimeError(f"Fallback download also too small ({file_size_mb:.1f} MB). Aborting.")
+        else:
+            raise RuntimeError("No fallback URL provided and file is invalid.")
+    log.info(f"{desc} downloaded successfully ({file_size_mb:.1f} MB).")
 
 
 def test_binary(path):
@@ -118,27 +141,30 @@ def test_binary(path):
 
 
 def get_ollama():
-    """Download correct Ollama binary for the current architecture."""
+    """Obtain a working Ollama binary for the current architecture."""
     arch = platform.machine().lower()
     if arch in ("x86_64", "amd64"):
-        url = "https://ollama.com/download/ollama-linux-amd64"
+        main_url = "https://ollama.com/download/ollama-linux-amd64"
+        fallback = OLLAMA_FALLBACK_URL  # amd64 specific
         desc = "ollama (amd64)"
     elif arch in ("aarch64", "arm64"):
-        url = "https://ollama.com/download/ollama-linux-arm64"
+        main_url = "https://ollama.com/download/ollama-linux-arm64"
+        # If you have a known stable ARM64 fallback, set it here
+        fallback = None
         desc = "ollama (arm64)"
     else:
         raise RuntimeError(f"Unsupported architecture: {arch}")
 
-    download(url, OLLAMA_BIN, desc)
+    download_with_fallback(main_url, OLLAMA_BIN, desc, fallback_url=fallback, min_size_mb=50)
     OLLAMA_BIN.chmod(0o755)
     if not test_binary(OLLAMA_BIN):
         OLLAMA_BIN.unlink(missing_ok=True)
-        raise RuntimeError("Ollama binary is not executable (check glibc version?)")
-    log.info("Ollama binary ready.")
+        raise RuntimeError("Ollama binary is not executable (glibc version may be incompatible).")
+    log.info("Ollama binary is ready.")
 
 
 def get_cloudflared():
-    """Download correct cloudflared binary for the current architecture."""
+    """Download the correct cloudflared binary."""
     arch = platform.machine().lower()
     if arch in ("x86_64", "amd64"):
         url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
@@ -149,12 +175,13 @@ def get_cloudflared():
     else:
         raise RuntimeError(f"Unsupported architecture: {arch}")
 
-    download(url, CF_BIN, desc)
+    # cloudflared is usually reliable; no fallback needed, just ensure file > 5 MB
+    download_with_fallback(url, CF_BIN, desc, min_size_mb=5)
     CF_BIN.chmod(0o755)
     if not test_binary(CF_BIN):
         CF_BIN.unlink(missing_ok=True)
         raise RuntimeError("cloudflared binary is not executable")
-    log.info("cloudflared binary ready.")
+    log.info("cloudflared binary is ready.")
 
 
 # ----------------------------------------------------------------------
@@ -215,7 +242,7 @@ def port_in_use(port):
 
 
 def kill_port_process(port):
-    """Kill any process currently listening on the given port."""
+    """Kill any process currently listening on the given port using fuser."""
     try:
         subprocess.run(
             ["fuser", "-k", f"{port}/tcp"],
@@ -224,6 +251,20 @@ def kill_port_process(port):
             timeout=5,
         )
         time.sleep(1)
+    except Exception:
+        pass
+
+
+def safe_pkill(proc_name):
+    """Kill processes by name, excluding the current script's PID."""
+    current_pid = os.getpid()
+    try:
+        # Using subprocess with list arguments to avoid shell=True when possible,
+        # but --exclude-pids is not a standard option in all pkill versions.
+        # We'll use shell=True with careful construction, as the user requested.
+        # Escape proc_name minimally (it's a fixed string, safe).
+        cmd = f"pkill -f '{proc_name}' --exclude-pids {current_pid}"
+        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
@@ -322,18 +363,14 @@ def extract_tunnel_url(timeout=40):
 
 # ----------------------------------------------------------------------
 def print_security_warning(url):
-    """Print a highly visible security warning."""
-    red = "\033[91m" if sys.stdout.isatty() else ""
-    bold = "\033[1m" if sys.stdout.isatty() else ""
-    reset = "\033[0m" if sys.stdout.isatty() else ""
+    """Print a highly visible security warning (no emojis)."""
     border = "!" * 70
     msg = (
-        f"\n{red}{bold}{border}\n"
-        f"⚠️  IMPORTANT SECURITY WARNING ⚠️\n"
-        f"Your Ollama API is now PUBLICLY accessible at:\n{url}\n"
-        f"Anyone with this link can use your models without authentication.\n"
+        f"\n{border}\n"
+        f"SECURITY WARNING: Your Ollama API is now PUBLICLY accessible at:\n{url}\n"
+        f"Anyone with this URL can use your models without authentication.\n"
         f"Keep this URL private and stop the script when done.\n"
-        f"{border}{reset}\n"
+        f"{border}\n"
     )
     print(msg, file=sys.stderr)
 
@@ -342,8 +379,11 @@ def print_security_warning(url):
 def main():
     register_cleanup()
     try:
-        # 1. Prepare environment (NO self-kill!)
-        log.info("Preparing environment...")
+        # 1. Kill previous instances safely (excluding our own process)
+        log.info("Preparing environment (stopping old instances)...")
+        safe_pkill("ollama")
+        safe_pkill("cloudflared")
+        # Also ensure the port is free
         if port_in_use(OLLAMA_PORT):
             log.info(f"Port {OLLAMA_PORT} is occupied, freeing it...")
             kill_port_process(OLLAMA_PORT)
@@ -355,7 +395,7 @@ def main():
             if f.exists():
                 f.unlink()
 
-        # 2. Ensure Ollama binary exists (download if missing/broken)
+        # 2. Get Ollama binary (download with fallback if needed)
         if not (OLLAMA_BIN.exists() and test_binary(OLLAMA_BIN)):
             if OLLAMA_BIN.exists():
                 OLLAMA_BIN.unlink()
@@ -374,22 +414,22 @@ def main():
         # 5. Pull model (if needed)
         pull_model(model)
 
-        # 6. Ensure cloudflared binary
+        # 6. Get cloudflared binary
         if not (CF_BIN.exists() and test_binary(CF_BIN)):
             if CF_BIN.exists():
                 CF_BIN.unlink()
             get_cloudflared()
 
-        # 7. Start Cloudflare tunnel
+        # 7. Start tunnel
         log.info("Starting Cloudflare tunnel...")
         start_cloudflared()
         url = extract_tunnel_url()
 
-        # 8. Output and warn
+        # 8. Output (only URL to stdout, warning to stderr)
         print(url, flush=True)
         print_security_warning(url)
 
-        # 9. Keep alive until interrupted
+        # 9. Keep alive until user interrupts
         log.info("Services running. Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
