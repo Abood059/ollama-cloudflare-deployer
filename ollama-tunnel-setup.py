@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Ollama + Cloudflare Tunnel Deployer – Fixed & Simplified for Colab/Linux
-- Installs system tools (zstd, curl)
-- Installs Ollama using the official script, then uses the installed binary directly
-- Selects best model based on total memory
-- Exposes API via Cloudflare TryCloudflare tunnel
-- Clean exit, no symlink copying issues
+Ollama + Cloudflare Tunnel – Production‑Ready Deployer
+- Installs essential system tools (zstd, curl)
+- Installs Ollama via official script (no manual extraction)
+- Installs cloudflared via official .deb package (avoids binary issues)
+- Automatically selects the optimal model based on total memory
+- Exposes the API securely through a Cloudflare TryCloudflare tunnel
+- Safe cleanup on exit, no self‑termination, clean English output
 """
 
 import os
@@ -25,13 +26,8 @@ from pathlib import Path
 # ----------------------------------------------------------------------
 # Configuration
 OLLAMA_PORT = 11434
-CF_BIN = Path("./cf_bin")
 CF_LOG = Path("cf.log")
 OLLAMA_LOG = Path("ollama.log")
-
-# Мы будем использовать установленный бинарник напрямую, без копирования.
-# Здесь сохраним путь после установки.
-INSTALLED_OLLAMA = None
 
 MODELS = [
     (2, "qwen2.5-coder:3b-instruct-q6_K"),
@@ -42,7 +38,9 @@ MODELS = [
     (40, "qwen2.5-coder:32b-instruct-q4_K_M"),
 ]
 
+# Global handles for cleanup
 processes = []
+INSTALLED_OLLAMA = None   # path to the real ollama binary
 
 # ----------------------------------------------------------------------
 logging.basicConfig(
@@ -53,9 +51,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ======================================================================
-# Helpers
+# Helper utilities
 # ======================================================================
 def safe_kill(proc):
+    """Terminate a subprocess gracefully, then force kill."""
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -69,6 +68,7 @@ def safe_kill(proc):
             pass
 
 def cleanup():
+    """Kill all background processes and remove log files."""
     log.info("Cleaning up...")
     for proc in processes:
         safe_kill(proc)
@@ -87,6 +87,7 @@ def register_cleanup():
     signal.signal(signal.SIGTERM, signal_handler)
 
 def safe_pkill(proc_name):
+    """Kill processes by name, excluding the current script PID."""
     current_pid = os.getpid()
     try:
         subprocess.run(
@@ -99,7 +100,11 @@ def safe_pkill(proc_name):
         pass
 
 def download_file(url, dest, desc="file", min_size_mb=10):
-    log.info(f"Downloading {desc} from {url}...")
+    """
+    Download a file using curl with a browser User‑Agent.
+    Raises an error if the file is too small (likely a download error).
+    """
+    log.info(f"Downloading {desc} from {url} ...")
     try:
         subprocess.run(
             [
@@ -114,36 +119,34 @@ def download_file(url, dest, desc="file", min_size_mb=10):
             check=True,
         )
     except FileNotFoundError:
-        raise RuntimeError("curl is required. Install it: sudo apt install curl")
+        raise RuntimeError("curl is required. Install it with: sudo apt install curl")
     size_mb = dest.stat().st_size / (1024*1024) if dest.exists() else 0
     if size_mb < min_size_mb:
-        raise RuntimeError(f"Downloaded {desc} is too small ({size_mb:.1f} MB). Possibly an error page.")
+        raise RuntimeError(f"Downloaded {desc} is too small ({size_mb:.1f} MB) – probably an error page.")
     log.info(f"{desc} downloaded ({size_mb:.1f} MB).")
 
 def ensure_system_tools():
+    """Install zstd and curl if they are missing (important for Colab)."""
     log.info("Checking/installing system tools (zstd, curl)...")
     try:
-        subprocess.run(["apt-get", "update", "-qq"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["apt-get", "update", "-qq"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["apt-get", "install", "-y", "-qq", "zstd", "curl"], check=True)
-        log.info("System tools ready (zstd, curl).")
+        log.info("System tools ready.")
     except Exception as e:
-        log.warning(f"Could not install tools: {e}")
+        log.warning(f"Could not install zstd/curl via apt: {e}")
 
 def test_binary(path):
-    try:
-        subprocess.run([str(path), "--version"], capture_output=True, timeout=10, check=True)
-        return True
-    except Exception:
-        return False
+    """Return True if the path is an executable file."""
+    return Path(path).is_file() and os.access(path, os.X_OK)
 
 # ======================================================================
-# Ollama acquisition – используем официальный установщик без копирования
+# Ollama installation – official script, no manual archive extraction
 # ======================================================================
 def get_ollama():
     """
-    Install Ollama using the official script.
-    Then locate the real binary (resolving symlinks) and set INSTALLED_OLLAMA.
-    We'll use it directly – no copy needed.
+    Install Ollama using the official install script.
+    Sets the global INSTALLED_OLLAMA to the real binary path.
     """
     global INSTALLED_OLLAMA
     log.info("Installing Ollama via official install script...")
@@ -155,26 +158,24 @@ def get_ollama():
         )
         log.info("Ollama installed successfully via official script.")
     except subprocess.CalledProcessError:
-        raise RuntimeError("Official install script failed.")
+        raise RuntimeError("Official Ollama install script failed.")
 
-    # Find the binary (common paths)
-    possible_locations = ["/usr/local/bin/ollama", "/usr/bin/ollama"]
+    # Locate the installed binary (usually /usr/local/bin/ollama or /usr/bin/ollama)
+    possible_paths = ["/usr/local/bin/ollama", "/usr/bin/ollama"]
     installed = None
-    for loc in possible_locations:
-        if os.path.exists(loc):
-            installed = loc
+    for p in possible_paths:
+        if os.path.exists(p):
+            installed = p
             break
     if installed is None:
-        # Fallback to which
         installed = shutil.which("ollama")
     if installed is None:
         raise RuntimeError("Cannot find installed ollama binary.")
 
-    # Resolve symlink to actual file if needed
+    # Resolve symlinks to get the real file
     installed_real = os.path.realpath(installed)
     if not os.path.exists(installed_real):
         raise RuntimeError(f"Resolved path {installed_real} does not exist.")
-
     if not test_binary(installed_real):
         raise RuntimeError(f"Installed ollama at {installed_real} is not executable.")
 
@@ -182,29 +183,44 @@ def get_ollama():
     log.info(f"Using Ollama binary: {INSTALLED_OLLAMA}")
 
 # ======================================================================
-# Cloudflared (unchanged)
+# Cloudflared installation – official .deb package (avoids binary issues)
 # ======================================================================
 def get_cloudflared():
+    """Download and install cloudflared using the official .deb package."""
     arch = platform.machine().lower()
     if arch in ("x86_64", "amd64"):
-        url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-        desc = "cloudflared (amd64)"
+        url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
+        desc = "cloudflared (amd64 deb)"
     elif arch in ("aarch64", "arm64"):
-        url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
-        desc = "cloudflared (arm64)"
+        url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb"
+        desc = "cloudflared (arm64 deb)"
     else:
         raise RuntimeError(f"Unsupported architecture: {arch}")
-    download_file(url, CF_BIN, desc, min_size_mb=5)
-    CF_BIN.chmod(0o755)
-    if not test_binary(CF_BIN):
-        CF_BIN.unlink(missing_ok=True)
-        raise RuntimeError("cloudflared binary is not executable")
-    log.info("cloudflared binary ready.")
+
+    deb_path = Path("./cloudflared.deb")
+    download_file(url, deb_path, desc, min_size_mb=5)
+
+    log.info(f"Installing {desc}...")
+    try:
+        subprocess.run(["dpkg", "-i", str(deb_path)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        log.warning("dpkg failed, attempting to fix dependencies...")
+        subprocess.run(["apt-get", "install", "-f", "-y"], check=True)
+        subprocess.run(["dpkg", "-i", str(deb_path)], check=True)
+    finally:
+        deb_path.unlink(missing_ok=True)
+
+    cloudflared_path = shutil.which("cloudflared")
+    if not cloudflared_path:
+        raise RuntimeError("cloudflared not found after .deb installation.")
+    log.info(f"cloudflared installed at: {cloudflared_path}")
 
 # ======================================================================
 # System detection
 # ======================================================================
 def total_memory_gb():
+    """Detect total RAM + GPU VRAM in GB."""
     ram = 0
     vram = 0
     try:
@@ -230,6 +246,7 @@ def total_memory_gb():
     return total
 
 def select_model(mem_gb):
+    """Choose the largest model that fits in 85% of total memory."""
     usable = mem_gb * 0.85
     selected = None
     for th, model in MODELS:
@@ -243,12 +260,15 @@ def select_model(mem_gb):
     return selected
 
 def port_in_use(port):
+    """Check if a TCP port is open on localhost."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 def kill_port_process(port):
+    """Kill any process listening on the given port using fuser."""
     try:
-        subprocess.run(["fuser", "-k", f"{port}/tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        subprocess.run(["fuser", "-k", f"{port}/tcp"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
         time.sleep(1)
     except Exception:
         pass
@@ -273,8 +293,7 @@ def pull_model(model_name):
     usage = shutil.disk_usage(".")
     free_gb = usage.free / (1024**3)
     if free_gb < 5:
-        raise RuntimeError(f"Insufficient disk space ({free_gb:.1f} GB). Need >=5 GB.")
-    # Use INSTALLED_OLLAMA directly
+        raise RuntimeError(f"Insufficient disk space ({free_gb:.1f} GB). Need >= 5 GB.")
     subprocess.run(
         [INSTALLED_OLLAMA, "pull", model_name],
         stdout=sys.stdout, stderr=subprocess.STDOUT, check=True
@@ -293,9 +312,12 @@ def start_ollama_server():
     processes.append(proc)
 
 def start_cloudflared():
+    cloudflared_cmd = shutil.which("cloudflared")
+    if not cloudflared_cmd:
+        raise RuntimeError("cloudflared not found in PATH.")
     log_file = open(CF_LOG, "w")
     proc = subprocess.Popen(
-        [str(CF_BIN), "tunnel", "--url", f"http://127.0.0.1:{OLLAMA_PORT}"],
+        [cloudflared_cmd, "tunnel", "--url", f"http://127.0.0.1:{OLLAMA_PORT}"],
         stdout=log_file, stderr=subprocess.STDOUT,
         preexec_fn=os.setpgrp,
     )
@@ -310,6 +332,7 @@ def extract_tunnel_url(timeout=40):
             match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", text)
             if match:
                 return match.group()
+        # Monitor cloudflared process
         for p in processes:
             if p and p.poll() is not None:
                 raise RuntimeError("cloudflared process died unexpectedly.")
@@ -343,28 +366,32 @@ def main():
             log.info("Freeing port 11434...")
             kill_port_process(OLLAMA_PORT)
             if port_in_use(OLLAMA_PORT):
-                raise RuntimeError("Port 11434 still in use.")
+                raise RuntimeError("Port 11434 still in use after kill attempt.")
 
         for f in [OLLAMA_LOG, CF_LOG]:
             f.unlink(missing_ok=True)
 
-        # Get Ollama (now sets INSTALLED_OLLAMA globally, no copy)
+        # Install/verify Ollama
         if INSTALLED_OLLAMA is None or not test_binary(INSTALLED_OLLAMA):
             get_ollama()
 
+        # Start Ollama server
         log.info("Starting Ollama server...")
         start_ollama_server()
         if not wait_for_ollama():
-            raise RuntimeError("Ollama server failed to start. Check ollama.log")
+            raise RuntimeError("Ollama server did not start. Check ollama.log")
 
+        # Memory detection & model pull
         mem = total_memory_gb()
         model = select_model(mem)
         pull_model(model)
 
-        if not (CF_BIN.exists() and test_binary(CF_BIN)):
-            if CF_BIN.exists():
-                CF_BIN.unlink()
+        # Install cloudflared if missing
+        if not shutil.which("cloudflared"):
             get_cloudflared()
+        else:
+            log.info("cloudflared already installed.")
+
         log.info("Starting Cloudflare tunnel...")
         start_cloudflared()
         url = extract_tunnel_url()
