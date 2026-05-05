@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Ollama + Cloudflare Tunnel Deployer – Reliable Colab/Linux Edition
-- Installs required system dependencies (zstd, curl) if missing
-- Uses official Ollama install script for bulletproof binary acquisition
-- Selects best model according to total memory (RAM + VRAM)
-- Exposes API securely via Cloudflare TryCloudflare tunnel
-- Graceful cleanup on exit, no self‑termination, clear English output
+Ollama + Cloudflare Tunnel Deployer – Fixed & Simplified for Colab/Linux
+- Installs system tools (zstd, curl)
+- Installs Ollama using the official script, then uses the installed binary directly
+- Selects best model based on total memory
+- Exposes API via Cloudflare TryCloudflare tunnel
+- Clean exit, no symlink copying issues
 """
 
 import os
@@ -24,11 +24,14 @@ from pathlib import Path
 
 # ----------------------------------------------------------------------
 # Configuration
-OLLAMA_BIN = Path("./ollama_bin")
 OLLAMA_PORT = 11434
 CF_BIN = Path("./cf_bin")
 CF_LOG = Path("cf.log")
 OLLAMA_LOG = Path("ollama.log")
+
+# Мы будем использовать установленный бинарник напрямую, без копирования.
+# Здесь сохраним путь после установки.
+INSTALLED_OLLAMA = None
 
 MODELS = [
     (2, "qwen2.5-coder:3b-instruct-q6_K"),
@@ -39,7 +42,7 @@ MODELS = [
     (40, "qwen2.5-coder:32b-instruct-q4_K_M"),
 ]
 
-processes = []   # background processes to clean up
+processes = []
 
 # ----------------------------------------------------------------------
 logging.basicConfig(
@@ -84,7 +87,6 @@ def register_cleanup():
     signal.signal(signal.SIGTERM, signal_handler)
 
 def safe_pkill(proc_name):
-    """Kill processes by name, excluding current PID."""
     current_pid = os.getpid()
     try:
         subprocess.run(
@@ -97,13 +99,12 @@ def safe_pkill(proc_name):
         pass
 
 def download_file(url, dest, desc="file", min_size_mb=10):
-    """Download with curl, browser UA, and size check."""
     log.info(f"Downloading {desc} from {url}...")
     try:
         subprocess.run(
             [
                 "curl", "-L", "--progress-bar", "--retry", "3",
-                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "-o", str(dest),
                 url
             ],
@@ -120,52 +121,70 @@ def download_file(url, dest, desc="file", min_size_mb=10):
     log.info(f"{desc} downloaded ({size_mb:.1f} MB).")
 
 def ensure_system_tools():
-    """Install zstd and ensure tar supports zstd (Colab/Debian)."""
     log.info("Checking/installing system tools (zstd, curl)...")
     try:
         subprocess.run(["apt-get", "update", "-qq"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["apt-get", "install", "-y", "-qq", "zstd", "curl"], check=True)
         log.info("System tools ready (zstd, curl).")
     except Exception as e:
-        log.warning(f"Could not install zstd via apt: {e}. Will rely on fallback method.")
+        log.warning(f"Could not install tools: {e}")
 
+def test_binary(path):
+    try:
+        subprocess.run([str(path), "--version"], capture_output=True, timeout=10, check=True)
+        return True
+    except Exception:
+        return False
+
+# ======================================================================
+# Ollama acquisition – используем официальный установщик без копирования
+# ======================================================================
 def get_ollama():
     """
-    Use the official Ollama install script – the most reliable method.
-    It handles architecture, dependencies, permissions automatically.
+    Install Ollama using the official script.
+    Then locate the real binary (resolving symlinks) and set INSTALLED_OLLAMA.
+    We'll use it directly – no copy needed.
     """
-    log.info("Installing Ollama using the official install script...")
+    global INSTALLED_OLLAMA
+    log.info("Installing Ollama via official install script...")
     try:
-        # Download and run the install script (needs curl, which we ensured)
         subprocess.run(
             "curl -fsSL https://ollama.com/install.sh | sh",
-            shell=True,
-            check=True,
-            executable="/bin/bash",
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            shell=True, check=True, executable="/bin/bash",
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         log.info("Ollama installed successfully via official script.")
     except subprocess.CalledProcessError:
-        raise RuntimeError("Official install script failed. Check network or permissions.")
+        raise RuntimeError("Official install script failed.")
 
-    # The binary is now in /usr/local/bin/ollama (or /usr/bin/ollama). Copy it.
-    installed = shutil.which("ollama")
-    if not installed:
-        raise RuntimeError("Ollama binary not found after installation.")
-    OLLAMA_BIN.unlink(missing_ok=True)
-    shutil.copy2(installed, OLLAMA_BIN)
-    OLLAMA_BIN.chmod(0o755)
-    # Quick verification
-    try:
-        subprocess.run([str(OLLAMA_BIN), "--version"], capture_output=True, check=True)
-        log.info("Ollama binary copy verified.")
-    except subprocess.CalledProcessError:
-        raise RuntimeError("Installed ollama binary does not run correctly.")
-    log.info(f"Ollama ready at {OLLAMA_BIN}")
+    # Find the binary (common paths)
+    possible_locations = ["/usr/local/bin/ollama", "/usr/bin/ollama"]
+    installed = None
+    for loc in possible_locations:
+        if os.path.exists(loc):
+            installed = loc
+            break
+    if installed is None:
+        # Fallback to which
+        installed = shutil.which("ollama")
+    if installed is None:
+        raise RuntimeError("Cannot find installed ollama binary.")
 
+    # Resolve symlink to actual file if needed
+    installed_real = os.path.realpath(installed)
+    if not os.path.exists(installed_real):
+        raise RuntimeError(f"Resolved path {installed_real} does not exist.")
+
+    if not test_binary(installed_real):
+        raise RuntimeError(f"Installed ollama at {installed_real} is not executable.")
+
+    INSTALLED_OLLAMA = installed_real
+    log.info(f"Using Ollama binary: {INSTALLED_OLLAMA}")
+
+# ======================================================================
+# Cloudflared (unchanged)
+# ======================================================================
 def get_cloudflared():
-    """Download cloudflared binary (amd64/arm64)."""
     arch = platform.machine().lower()
     if arch in ("x86_64", "amd64"):
         url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
@@ -181,13 +200,6 @@ def get_cloudflared():
         CF_BIN.unlink(missing_ok=True)
         raise RuntimeError("cloudflared binary is not executable")
     log.info("cloudflared binary ready.")
-
-def test_binary(path):
-    try:
-        subprocess.run([str(path), "--version"], capture_output=True, timeout=10, check=True)
-        return True
-    except Exception:
-        return False
 
 # ======================================================================
 # System detection
@@ -262,8 +274,9 @@ def pull_model(model_name):
     free_gb = usage.free / (1024**3)
     if free_gb < 5:
         raise RuntimeError(f"Insufficient disk space ({free_gb:.1f} GB). Need >=5 GB.")
+    # Use INSTALLED_OLLAMA directly
     subprocess.run(
-        [str(OLLAMA_BIN), "pull", model_name],
+        [INSTALLED_OLLAMA, "pull", model_name],
         stdout=sys.stdout, stderr=subprocess.STDOUT, check=True
     )
 
@@ -273,7 +286,7 @@ def start_ollama_server():
     env["OLLAMA_ORIGINS"] = "*"
     log_file = open(OLLAMA_LOG, "w")
     proc = subprocess.Popen(
-        [str(OLLAMA_BIN), "serve"],
+        [INSTALLED_OLLAMA, "serve"],
         stdout=log_file, stderr=subprocess.STDOUT,
         env=env, preexec_fn=os.setpgrp,
     )
@@ -321,10 +334,8 @@ Keep it private and stop the script when done.
 def main():
     register_cleanup()
     try:
-        # 0. Install system tools first
         ensure_system_tools()
 
-        # 1. Stop any previous instances (safely)
         log.info("Preparing environment (stopping old instances)...")
         safe_pkill("ollama")
         safe_pkill("cloudflared")
@@ -332,28 +343,24 @@ def main():
             log.info("Freeing port 11434...")
             kill_port_process(OLLAMA_PORT)
             if port_in_use(OLLAMA_PORT):
-                raise RuntimeError("Port 11434 still in use after kill attempt.")
+                raise RuntimeError("Port 11434 still in use.")
+
         for f in [OLLAMA_LOG, CF_LOG]:
             f.unlink(missing_ok=True)
 
-        # 2. Obtain Ollama binary (official install script)
-        if not (OLLAMA_BIN.exists() and test_binary(OLLAMA_BIN)):
-            if OLLAMA_BIN.exists():
-                OLLAMA_BIN.unlink()
+        # Get Ollama (now sets INSTALLED_OLLAMA globally, no copy)
+        if INSTALLED_OLLAMA is None or not test_binary(INSTALLED_OLLAMA):
             get_ollama()
 
-        # 3. Start Ollama server
         log.info("Starting Ollama server...")
         start_ollama_server()
         if not wait_for_ollama():
             raise RuntimeError("Ollama server failed to start. Check ollama.log")
 
-        # 4. Memory + model
         mem = total_memory_gb()
         model = select_model(mem)
         pull_model(model)
 
-        # 5. Cloudflared
         if not (CF_BIN.exists() and test_binary(CF_BIN)):
             if CF_BIN.exists():
                 CF_BIN.unlink()
@@ -362,7 +369,6 @@ def main():
         start_cloudflared()
         url = extract_tunnel_url()
 
-        # 6. Output
         print(url, flush=True)
         print_warning(url)
 
