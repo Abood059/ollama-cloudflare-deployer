@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Professional Adaptive Ollama + Cloudflare Tunnel
+Professional Adaptive Ollama + Cloudflare Tunnel (Fixed Self‑Kill)
 - Auto-detects architecture, downloads correct binaries only
 - Selects best model based on total memory
 - Launches Ollama, pulls model, exposes via Cloudflare Tunnel
 - Handles cleanup gracefully on exit (SIGINT, SIGTERM, normal)
-- Robust error handling, never crashes unexpectedly
+- Robust error handling, no more accidental self‑termination
 """
 
 import os
@@ -54,7 +54,7 @@ log = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
 def safe_kill(proc):
-    """Terminate a subprocess gracefully, then kill."""
+    """Terminate a subprocess gracefully, then force kill if needed."""
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -71,25 +71,24 @@ def safe_kill(proc):
 
 
 def cleanup():
-    """Terminate all background processes and remove temporary files."""
+    """Terminate all background processes and remove log files."""
     log.info("Cleaning up...")
     for proc in processes:
         safe_kill(proc)
-    # Remove log files, keep binaries for reuse
     for f in [OLLAMA_LOG, CF_LOG]:
         if f.exists():
             f.unlink()
 
 
 def signal_handler(signum, frame):
-    """Handle termination signals."""
+    """Handle SIGINT / SIGTERM gracefully."""
     log.warning(f"Received signal {signum}, exiting...")
     cleanup()
     sys.exit(0)
 
 
 def register_cleanup():
-    """Register cleanup actions."""
+    """Register cleanup on normal exit and signals."""
     atexit.register(cleanup)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -97,7 +96,7 @@ def register_cleanup():
 
 # ----------------------------------------------------------------------
 def download(url, dest, desc="file"):
-    """Download a file with progress indication and timeout."""
+    """Download a file with descriptive error message."""
     log.info(f"Downloading {desc} from {url}...")
     try:
         urllib.request.urlretrieve(url, dest)
@@ -106,7 +105,7 @@ def download(url, dest, desc="file"):
 
 
 def test_binary(path):
-    """Check if binary is executable and runs --version successfully."""
+    """Check if binary is executable and responds to --version."""
     try:
         result = subprocess.run(
             [str(path), "--version"],
@@ -119,7 +118,7 @@ def test_binary(path):
 
 
 def get_ollama():
-    """Download the correct Ollama binary for current architecture."""
+    """Download correct Ollama binary for the current architecture."""
     arch = platform.machine().lower()
     if arch in ("x86_64", "amd64"):
         url = "https://ollama.com/download/ollama-linux-amd64"
@@ -134,12 +133,12 @@ def get_ollama():
     OLLAMA_BIN.chmod(0o755)
     if not test_binary(OLLAMA_BIN):
         OLLAMA_BIN.unlink(missing_ok=True)
-        raise RuntimeError("Ollama binary is not executable on this system (glibc version?)")
+        raise RuntimeError("Ollama binary is not executable (check glibc version?)")
     log.info("Ollama binary ready.")
 
 
 def get_cloudflared():
-    """Download the correct cloudflared binary."""
+    """Download correct cloudflared binary for the current architecture."""
     arch = platform.machine().lower()
     if arch in ("x86_64", "amd64"):
         url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
@@ -160,14 +159,10 @@ def get_cloudflared():
 
 # ----------------------------------------------------------------------
 def total_memory_gb():
-    """
-    Detect total system RAM + GPU VRAM (in GB).
-    Falls back to safe low value if detection fails.
-    """
+    """Detect total system RAM + GPU VRAM in GB."""
     ram_gb = 0
     vram_gb = 0
 
-    # RAM detection via /proc/meminfo (most reliable, no extra package)
     try:
         with open("/proc/meminfo") as f:
             for line in f:
@@ -179,13 +174,11 @@ def total_memory_gb():
         log.warning("Cannot read /proc/meminfo, assuming 2 GB RAM.")
         ram_gb = 2.0
 
-    # GPU VRAM detection via nvidia-smi
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
             timeout=5,
         ).decode()
-        # Sum all GPUs memory
         vram_mb = sum(int(x) for x in out.strip().splitlines())
         vram_gb = vram_mb / 1024.0
     except Exception:
@@ -199,8 +192,7 @@ def total_memory_gb():
 
 
 def select_model(mem_gb):
-    """Select the largest model that fits within available memory, with safety margin."""
-    # Use 85% of total memory for model to leave room for context and system
+    """Select largest model that fits safely (85% of total memory)."""
     usable = mem_gb * 0.85
     selected = None
     for threshold, model in MODELS:
@@ -209,22 +201,21 @@ def select_model(mem_gb):
         else:
             break
     if selected is None:
-        # Fallback to smallest model (should never happen if fallback memory >= 2)
         selected = MODELS[0][1]
-        log.warning("Very low memory, forced to use smallest model.")
-    log.info(f"Selected model: {selected} (usable memory {usable:.1f} GB)")
+        log.warning("Very low memory, using smallest model.")
+    log.info(f"Selected model: {selected} (usable {usable:.1f} GB)")
     return selected
 
 
 # ----------------------------------------------------------------------
 def port_in_use(port):
-    """Check if a TCP port is currently open."""
+    """Check if a TCP port is listening on localhost."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
 def kill_port_process(port):
-    """Try to kill any process listening on given port using fuser (if available)."""
+    """Kill any process currently listening on the given port."""
     try:
         subprocess.run(
             ["fuser", "-k", f"{port}/tcp"],
@@ -254,9 +245,8 @@ def wait_for_ollama(timeout=60):
 
 
 def pull_model(model_name):
-    """Pull the selected model, with error handling."""
+    """Pull the Ollama model, with disk space check."""
     log.info(f"Pulling model {model_name}...")
-    # Check available disk space (need at least ~10 GB free for safety)
     try:
         usage = shutil.disk_usage(".")
         free_gb = usage.free / (1024**3)
@@ -275,10 +265,10 @@ def pull_model(model_name):
 
 
 def start_ollama_server():
-    """Launch Ollama server in background."""
+    """Launch Ollama server process."""
     env = os.environ.copy()
     env["OLLAMA_HOST"] = f"0.0.0.0:{OLLAMA_PORT}"
-    env["OLLAMA_ORIGINS"] = "*"  # needed for browser access; see security warning
+    env["OLLAMA_ORIGINS"] = "*"
 
     log_file = open(OLLAMA_LOG, "w")
     proc = subprocess.Popen(
@@ -286,14 +276,14 @@ def start_ollama_server():
         stdout=log_file,
         stderr=subprocess.STDOUT,
         env=env,
-        preexec_fn=os.setpgrp,  # detach from parent group
+        preexec_fn=os.setpgrp,
     )
     processes.append(proc)
     return proc
 
 
 def start_cloudflared():
-    """Start cloudflared tunnel and return the process."""
+    """Start cloudflared tunnel process."""
     log_file = open(CF_LOG, "w")
     proc = subprocess.Popen(
         [str(CF_BIN), "tunnel", "--url", f"http://127.0.0.1:{OLLAMA_PORT}"],
@@ -306,7 +296,7 @@ def start_cloudflared():
 
 
 def extract_tunnel_url(timeout=40):
-    """Wait for the Cloudflare tunnel URL to appear in the log."""
+    """Extract the trycloudflare.com URL from the tunnel log."""
     log.info("Waiting for Cloudflare tunnel URL...")
     start = time.time()
     while time.time() - start < timeout:
@@ -322,7 +312,7 @@ def extract_tunnel_url(timeout=40):
                 return url
         except Exception:
             pass
-        # Check if cloudflared process died
+        # If cloudflared process died early, report error
         for p in processes:
             if p is not None and p.poll() is not None:
                 raise RuntimeError("Cloudflared process exited unexpectedly.")
@@ -341,7 +331,7 @@ def print_security_warning(url):
         f"\n{red}{bold}{border}\n"
         f"⚠️  IMPORTANT SECURITY WARNING ⚠️\n"
         f"Your Ollama API is now PUBLICLY accessible at:\n{url}\n"
-        f"Anyone with this link can use your Ollama models without authentication.\n"
+        f"Anyone with this link can use your models without authentication.\n"
         f"Keep this URL private and stop the script when done.\n"
         f"{border}{reset}\n"
     )
@@ -352,67 +342,54 @@ def print_security_warning(url):
 def main():
     register_cleanup()
     try:
-        # 1. Kill any previous instances & free port
+        # 1. Prepare environment (NO self-kill!)
         log.info("Preparing environment...")
-        # Try to kill existing ollama/cloudflared processes gently
-        for proc_name in ["ollama", "cloudflared"]:
-            try:
-                subprocess.run(
-                    ["pkill", "-f", proc_name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                pass
-        # Free the port if occupied
         if port_in_use(OLLAMA_PORT):
-            log.info(f"Port {OLLAMA_PORT} is in use, attempting to free it...")
+            log.info(f"Port {OLLAMA_PORT} is occupied, freeing it...")
             kill_port_process(OLLAMA_PORT)
             if port_in_use(OLLAMA_PORT):
-                raise RuntimeError(f"Port {OLLAMA_PORT} still occupied. Please free it manually.")
+                raise RuntimeError(f"Port {OLLAMA_PORT} still in use. Please free it manually.")
 
-        # 2. Cleanup old logs but keep binaries if valid (optional)
+        # Remove old logs
         for f in [OLLAMA_LOG, CF_LOG]:
             if f.exists():
                 f.unlink()
 
-        # 3. Get Ollama binary (download if needed)
+        # 2. Ensure Ollama binary exists (download if missing/broken)
         if not (OLLAMA_BIN.exists() and test_binary(OLLAMA_BIN)):
             if OLLAMA_BIN.exists():
                 OLLAMA_BIN.unlink()
             get_ollama()
 
-        # 4. Start Ollama server
+        # 3. Start Ollama server
         log.info("Starting Ollama server...")
         start_ollama_server()
         if not wait_for_ollama():
-            raise RuntimeError("Ollama server failed to start. Check ollama.log")
+            raise RuntimeError("Ollama server failed to start (check ollama.log)")
 
-        # 5. Detect memory and select model
+        # 4. Detect memory and select model
         mem_gb = total_memory_gb()
         model = select_model(mem_gb)
 
-        # 6. Pull the model (if not already cached)
-        log.info("Checking/pulling model...")
+        # 5. Pull model (if needed)
         pull_model(model)
 
-        # 7. Get cloudflared binary
+        # 6. Ensure cloudflared binary
         if not (CF_BIN.exists() and test_binary(CF_BIN)):
             if CF_BIN.exists():
                 CF_BIN.unlink()
             get_cloudflared()
 
-        # 8. Start tunnel
+        # 7. Start Cloudflare tunnel
         log.info("Starting Cloudflare tunnel...")
         start_cloudflared()
         url = extract_tunnel_url()
 
-        # 9. Output only the URL to stdout (for scripting)
+        # 8. Output and warn
         print(url, flush=True)
-        # Print security warning to stderr
         print_security_warning(url)
 
-        # 10. Keep running until interrupted
+        # 9. Keep alive until interrupted
         log.info("Services running. Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
